@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026-10-22]
+- Switch Azure AD Sync (WCF Binary) to the Microsoft Entra AD Synchronization Service (`6bf85cfa-ac8a-4be5-b5de-425a0d0dc016`) using PFX-based application authentication, the `6bf85cfa-ac8a-4be5-b5de-425a0d0dc016/.default` scope, and `ADSynchronization.ReadWrite.All`; use Microsoft Graph application permissions for user/group reads.
+- Add configurable `entra_aba_dir` (default: `/root/entra_aba`) for the PFX identity; support certificate rotation.
+- Keep administrator tokens for DirSync and Seamless SSO in memory only; require interactive execution for SSO password renewal and log an error during unattended runs.
+
 ## [2025-08-31]
 - Fix : Only log after successful action, add "data" in error log.
 

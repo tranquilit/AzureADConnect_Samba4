@@ -44,9 +44,6 @@ class AdConnect():
 
         self.domain= None
         self.tenant_id= None
-        self.save_to_cache=True
-        self.use_cache = True
-        self.cache_file = os.path.join(os.path.dirname(os.path.realpath(__file__)),'last_token.json')
 
         self.dry_run=True
         self.sync_device=False
@@ -61,13 +58,10 @@ class AdConnect():
     def connect(self):
         if not self.az:
             self.az = AADInternals(proxies=self.proxiesconf,
-                                   use_cache=self.use_cache,
-                                   save_to_cache=self.save_to_cache,
                                    tenant_id=self.tenant_id,
-                                   cache_file=self.cache_file,
                                    domain=self.domain,
                                    verify=self.verify)
-            self.az.get_token(scopes=["https://graph.windows.net/.default"])
+            self.az.get_token(scopes=["6bf85cfa-ac8a-4be5-b5de-425a0d0dc016/.default"])
             self.tenant_id = self.az.tenant_id
 
 

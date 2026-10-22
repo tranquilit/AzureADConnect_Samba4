@@ -2,7 +2,7 @@
 
 azureadname = domain.com
 tenant_id = 00000000-0000-0000-0000-000000000000
-credential_cache_file = /root/last_token_azuread.json
+entra_aba_dir = /root/entra_aba
 
 proxy =
 

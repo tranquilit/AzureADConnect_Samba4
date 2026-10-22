@@ -120,13 +120,12 @@ Mode not recommended, it will cause problems with sso mode because the email is 
 
 ## other settings
 
-* credential_cache_file :
+* entra_aba_dir :
 
-
-specifies where the last connection token will be stored and read:
+Specifies the directory holding the PFX application identity (no administrator access token or refresh token is saved there). Defaults to `/root/entra_aba`.
 
 ```
-credential_cache_file = /root/last_token.json
+entra_aba_dir = /root/entra_aba
 ```
 
 * dbpath :

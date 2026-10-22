@@ -89,7 +89,7 @@ def run_sync(force=False,from_db=False):
     if dry_run:
         print('DRY RUN ON: the script will not perform any actions')
 
-    azure = AdConnect()
+    azure = AdConnect(entra_aba_dir=config.get("common", "entra_aba_dir", fallback="/root/entra_aba"))
     azure.dry_run = dry_run
     azure.sync_device = sync_device
     if config.get('common', 'proxy'):
@@ -113,19 +113,10 @@ def run_sync(force=False,from_db=False):
     if config.has_option('common', 'azureadname'):
         azure.domain = config.get('common', 'azureadname')
 
-    if config.has_option('common', 'save_to_cache'):
-        azure.save_to_cache = config.getboolean('common', 'save_to_cache')
-
     if config.has_option('common', 'enable_single_sign_on'):
         enable_single_sign_on = config.getboolean('common', 'enable_single_sign_on')
     else:
         enable_single_sign_on = False
-
-    if config.has_option('common', 'use_cache'):
-        azure.use_cache = config.getboolean('common', 'use_cache')  
-
-    if config.has_option('common', 'credential_cache_file'):
-        azure.cache_file = config.get('common', 'credential_cache_file')        
 
     basedn = None
     if config.has_option('common', 'basedn'):

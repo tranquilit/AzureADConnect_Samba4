@@ -13,7 +13,7 @@ from samba.auth import system_session
 from samba.credentials import Credentials
 from samba.samdb import SamDB
 from samba import param
-from AADInternals_python.AADInternals import AADInternals
+from AADInternals_python.AADInternals import AADInternals, SYNC_SCOPE
 
 from samba.dsdb import UF_ACCOUNTDISABLE
 from AdAccountReader import AdAccountReader
@@ -37,13 +37,14 @@ def generate_password(length=127):
 
 class AdConnect():
 
-    def __init__(self):
+    def __init__(self, entra_aba_dir="/root/entra_aba"):
 
 
         self.proxiesconf = None
 
         self.domain= None
         self.tenant_id= None
+        self.entra_aba_dir = entra_aba_dir
 
         self.dry_run=True
         self.sync_device=False
@@ -59,9 +60,10 @@ class AdConnect():
         if not self.az:
             self.az = AADInternals(proxies=self.proxiesconf,
                                    tenant_id=self.tenant_id,
+                                   entra_aba_dir=self.entra_aba_dir,
                                    domain=self.domain,
                                    verify=self.verify)
-            self.az.get_token(scopes=["6bf85cfa-ac8a-4be5-b5de-425a0d0dc016/.default"])
+            self.az.get_token(scopes=[SYNC_SCOPE])
             self.tenant_id = self.az.tenant_id
 
 

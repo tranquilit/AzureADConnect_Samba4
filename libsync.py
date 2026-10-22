@@ -126,7 +126,7 @@ class AdConnect():
             return
 
         try:
-            list_groups = self.az.list_groups(select="onPremisesImmutableId,userPrincipalName,id")
+            list_groups = self.az.list_groups(include_immutable_id=True, select="id")
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 list_groups = []

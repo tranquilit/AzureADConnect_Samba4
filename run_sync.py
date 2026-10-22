@@ -225,19 +225,26 @@ def run_sync(force=False,from_db=False):
             azure_ad_sso_expire = smb.azure_ad_sso_user_expire()
 
         if (not azure_ad_sso_user_exist) or azure_ad_sso_expire:
-            random_password = generate_password()
+            if sys.stdin.isatty():
+                random_password = generate_password()
 
-            if not azure_ad_sso_user_exist:
-                azure.set_desktop_sso_enabled()
-                write_log_json_data('enable_sso',{"enable_sso":True})
+                if not azure_ad_sso_user_exist:
+                    azure.set_desktop_sso_enabled()
+                    write_log_json_data('enable_sso', {"enable_sso": True})
 
-            azure.set_desktop_sso(domain_name=smb.domaine,password=random_password)
-            write_log_json_data('set_password_sso',{"domain_name":smb.domaine})
+                azure.set_desktop_sso(
+                    domain_name=smb.domaine,
+                    password=random_password
+                )
+                write_log_json_data('set_password_sso', {"domain_name": smb.domaine})
 
-            if not azure_ad_sso_user_exist:
-                smb.create_azureadssoacc()
+                if not azure_ad_sso_user_exist:
+                    smb.create_azureadssoacc()
 
-            smb.set_password_azureadssoacc(password=random_password)
+                smb.set_password_azureadssoacc(password=random_password)
+
+            else:
+                write_log_json_data('error', {'message': "The AZUREADSSOACC account password needs to be renewed. Please run the script interactively to perform this operation."})
 
     smb.generate_all_dict()
 

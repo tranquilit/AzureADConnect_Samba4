@@ -15,7 +15,7 @@ apt-get install git
 git clone --recurse-submodules https://github.com/tranquilit/AzureADConnect_Samba4.git /opt/sync-azure
 mkdir /etc/azureconf/
 cp -f /opt/sync-azure/azure.conf.exemple /etc/azureconf/azure.conf
-apt-get install python3-peewee python3-passlib python3-xmltodict python3-requests python3-msal -y
+apt-get install -y python3-peewee python3-passlib python3-xmltodict python3-requests python3-msal python3-cryptography python3-jwt
 ```
 
 

@@ -233,9 +233,7 @@ Exception: Access to Azure Active Directory has been denied. Contact Technical S
 
 ```
 
-It appears that the user you authenticated with does not have the rights to perform the requested actions.
-
-You can change user by deleting the /root/last_token_azuread.json file and running the script again.
+Check that the PFX application identity has the required Microsoft Entra permissions and that `entra_aba_dir` points to the correct certificate directory.
 
 ## Log parsing
 

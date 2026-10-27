@@ -10,29 +10,32 @@ If you use this script and it works correctly - please do not be lazy to put a s
 
 # Install notes
 
+On Debian 13, dependencies can be installed directly from the official repositories.
+
 ```
 apt-get install git
 git clone --recurse-submodules https://github.com/tranquilit/AzureADConnect_Samba4.git /opt/sync-azure
 mkdir /etc/azureconf/
 cp -f /opt/sync-azure/azure.conf.exemple /etc/azureconf/azure.conf
-apt-get install -y python3-peewee python3-passlib python3-xmltodict python3-requests python3-msal python3-cryptography python3-jwt
+apt-get install -y python3-samba python3-ldb python3-peewee python3-passlib python3-xmltodict python3-requests python3-msal python3-cryptography python3-jwt
 ```
 
 
-If you are not under debian or if you do not have the packages available :
+For Debian 12 or older Python packages, use a virtual environment with access to system-installed modules (including Samba/LDB):
 
 ```
-apt-get install python3-pip
-pip3 install -r /opt/sync-azure/requirements.txt
-pip3 install -r /opt/sync-azure/AADInternals_python/requirements.txt
+apt-get install -y python3-venv
+python3 -m venv --system-site-packages /opt/sync-azure/.venv
+/opt/sync-azure/.venv/bin/python -m pip install -r /opt/sync-azure/requirements.txt
+/opt/sync-azure/.venv/bin/python -m pip install -r /opt/sync-azure/AADInternals_python/requirements.txt
 ```
 
  - Configure /etc/azureconf/azure.conf
 
-You can try like this:
+Use the launcher below (it selects the virtualenv when present, otherwise system Python):
 
 ```
-python3 /opt/sync-azure/run_sync.py
+/opt/sync-azure/run_sync.sh
 ```
 
 The script sends all users and groups a first time and then only sends what has been modified since the last send during the next launch. (delta)
@@ -40,7 +43,7 @@ The script sends all users and groups a first time and then only sends what has 
 To force a send from all again, use --force (force sync) :
 
 ```
-python3 /opt/sync-azure/run_sync.py --force
+/opt/sync-azure/run_sync.sh --force
 ```
 
 &#x1F4A1; Once your first full sync has taken place, it's worth changing this setting to True to make the script run much faster. 
@@ -298,7 +301,7 @@ If the duplicate is not in your active directory this means that the duplicate i
 When you have resolved the conflicts it may sometimes be necessary to force a synchronization with:
 
 ```
-python3 /opt/sync-azure/run_sync.py --force
+/opt/sync-azure/run_sync.sh --force
 ```
 
 ## When you have an existing tenant

@@ -23,7 +23,8 @@ import samba.getopt as options
 
 logging.getLogger("adal-python").setLevel(logging.WARN)
 
-logger = logging.getLogger()
+logger = logging.getLogger("azure_ad_sync")
+logger.setLevel(logging.INFO)
 
 def write_log_json_data(action,data):
     logger.info(json.dumps({'type':action,'timestamp': str(datetime.datetime.utcnow()),'data':data}))
@@ -69,7 +70,10 @@ class AdConnect():
 
     def enable_ad_sync(self):
         self.connect()
+        if self.dry_run:
+            return
         self.az.set_adsyncenabled(enabledirsync=True)
+        
 
     def set_desktop_sso_enabled(self):
         self.connect()
@@ -83,7 +87,8 @@ class AdConnect():
 
     def enable_password_hash_sync(self):
         self.connect()
-        self.az.set_sync_features(enable_features=['PasswordHashSync'])
+        if not self.dry_run:
+            self.az.set_sync_features(enable_features=['PasswordHashSync'])
 
     def send_obj_to_az(self,entry):
         self.connect()
@@ -255,9 +260,13 @@ class SambaInfo():
         return bool(self.samdb_loc.search(base=self.samdb_loc.get_default_basedn(),expression='(servicePrincipalName=HOST/autologon.microsoftazuread-sso.com)'))
 
     def create_azureadssoacc(self,computername='azureadssoacc'):
+        if self.dry_run:
+            return
         self.samdb_loc.newcomputer(computername,service_principal_name_list=["HOST/aadg.windows.net.nsatc.net","HOST/autologon.microsoftazuread-sso.com"])
 
     def set_password_azureadssoacc(self,password=None,computername='azureadssoacc'):
+        if self.dry_run:
+            return
         self.samdb_loc.setpassword(search_filter='(samAccountName=%s$)' % computername,password=password,force_change_at_next_login=False)
 
     def write_service_connection_point(self,tenant_id,azureadname):

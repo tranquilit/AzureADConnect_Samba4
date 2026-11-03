@@ -58,9 +58,15 @@ if config.has_option('common', 'calculate_deletions_based_on_last_sync'):
     calculate_deletions_based_on_last_sync = config.getboolean('common', 'calculate_deletions_based_on_last_sync')
 
 if not dry_run:
-    if logfile:
-        fhandler = logging.FileHandler(logfile)
-        logger.addHandler(fhandler)
+    handlers = [logging.StreamHandler(sys.stdout)]
+elif logfile:
+    handlers = [logging.FileHandler(logfile)]
+    #if args.servicemode:
+    #    handlers.append(logging.StreamHandler(sys.stderr))
+else:
+    handlers = [logging.StreamHandler(sys.stderr)]
+logging.basicConfig(level=logging.WARNING, format='%(message)s', handlers=handlers, force=True)
+
 
 class AzureObject(Model):
     sourceanchor = CharField(primary_key=True, index=True)
@@ -226,6 +232,16 @@ def run_sync(force=False,from_db=False):
             azure_ad_sso_expire = smb.azure_ad_sso_user_expire()
 
         if (not azure_ad_sso_user_exist) or azure_ad_sso_expire:
+            if dry_run:
+                write_log_json_data(
+                    'sso',
+                    {
+                        'create_account': not azure_ad_sso_user_exist,
+                        'enable_sso_flag': not azure_ad_sso_user_exist,
+                        'rotate_password': True,
+                        'domain_name': smb.domaine
+                    }
+                )
             if sys.stdin.isatty():
                 random_password = generate_password()
 

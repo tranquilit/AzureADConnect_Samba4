@@ -64,42 +64,42 @@ class AdConnect():
     def enable_ad_sync(self):
         self.connect()
         if not self.dry_run:
-            self.az.set_adsyncenabled(enabledirsync=True)
+            self._with_retry(lambda: self.az.set_adsyncenabled(enabledirsync=True))
 
     def set_desktop_sso_enabled(self):
         self.connect()
         if not self.dry_run:
-            self.az.set_desktop_sso_enabled(enable=True)
+            self._with_retry(lambda: self.az.set_desktop_sso_enabled(enable=True))
 
     def set_desktop_sso(self, domain_name: str, password: str, computer_name: str = "AZUREADSSOACC", enable: bool = True):
         self.connect()
         if not self.dry_run:
-            self.az.set_desktop_sso( domain_name, password, computer_name, enable)
+            self._with_retry(lambda: self.az.set_desktop_sso(domain_name, password, computer_name, enable))
 
     def enable_password_hash_sync(self):
         self.connect()
         if not self.dry_run:
-            self.az.set_sync_features(enable_features=['PasswordHashSync'])
+            self._with_retry(lambda: self.az.set_sync_features(enable_features=['PasswordHashSync']))
 
     def send_obj_to_az(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.set_azureadobject(**entry)
+            self._with_retry(lambda: self.az.set_azureadobject(**entry))
 
     def delete_user(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.remove_azureadoject(sourceanchor=entry,objecttype='User')
+            self._with_retry(lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='User'))
 
     def delete_group(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.remove_azureadoject(sourceanchor=entry,objecttype='Group')
+            self._with_retry(lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='Group'))
 
     def delete_device(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.remove_azureadoject(sourceanchor=entry,objecttype='Device')            
+            self._with_retry(lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='Device'))
 
     def generate_all_dict(self):
         self.connect()
@@ -107,7 +107,9 @@ class AdConnect():
         self.dict_az_group = {}
         self.dict_az_devices = {}
 
-        for user in self.az.list_users(select="onPremisesImmutableId,userPrincipalName,onPremisesSyncEnabled"):
+        users = self._with_retry(lambda: list(self.az.list_users(
+            select="onPremisesImmutableId,userPrincipalName,onPremisesSyncEnabled")))
+        for user in users:
             if not user.get('onPremisesImmutableId'):
                 continue
             if not user.get('onPremisesSyncEnabled'):
@@ -118,7 +120,8 @@ class AdConnect():
             return
 
         try:
-            list_groups = self.az.list_groups(include_immutable_id=True, select="id")
+            list_groups = self._with_retry(lambda: list(
+                self.az.list_groups(include_immutable_id=True, select="id")))
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 list_groups = []
@@ -133,7 +136,7 @@ class AdConnect():
         if not self.sync_device:
             return
         try:
-            anchors = self.az.get_dict_cloudanchor_sourceanchor()
+            anchors = self._with_retry(lambda: self.az.get_dict_cloudanchor_sourceanchor())
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 anchors ={}
@@ -148,22 +151,11 @@ class AdConnect():
     def send_hashnt(self,hashnt,sourceanchor):
         self.connect()
         if not self.dry_run:
-            self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor)
+            self._with_retry(lambda: self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor))
 
     def get_sync_configuration(self):
-        """Read the sync configuration. A new Entra application may need some minutes
-        before it works; connect() waits for that. If the service answers "not yet"
-        although the wait was already done (a replica that has not caught up), wait
-        again, once, with fresh clients - only for a newly created application."""
-        self.connect()
-        try:
-            return self.az.get_syncconfiguration()
-        except Exception as exc:
-            if not (self._permission_pending(exc) and self._identity_is_new()):
-                raise
-        self._identity_confirmed = False
-        self.connect()
-        return self.az.get_syncconfiguration()
+        """Read the sync configuration (see _with_retry for "not yet" answers)."""
+        return self._with_retry(lambda: self.az.get_syncconfiguration())
 
     def _new_client(self):
         client = AADInternals(proxies=self.proxiesconf,
@@ -183,6 +175,24 @@ class AdConnect():
         if not self._identity_confirmed:
             self._wait_for_new_identity()
             self._identity_confirmed = True
+
+    def _with_retry(self, call, attempts=3, pause_seconds=15):
+        """Run one Entra call. connect() has confirmed the new application once, but
+        Entra answers "not yet" again now and then (replicas that have not caught up).
+        For an application created in the last hour such an answer starts the central
+        wait again and repeats the call, at most `attempts` times in total. Other
+        errors, and older applications, are raised at once. `call` must be safe to
+        repeat, and must read self.az when it runs (the wait replaces the client)."""
+        for attempt in range(1, attempts + 1):
+            self.connect()
+            try:
+                return call()
+            except Exception as exc:
+                if attempt == attempts \
+                        or not (self._permission_pending(exc) and self._identity_is_new()):
+                    raise
+            self._identity_confirmed = False
+            time.sleep(pause_seconds)
 
     def _identity_is_new(self, max_age_minutes=60):
         try:

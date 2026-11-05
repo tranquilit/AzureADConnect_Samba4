@@ -29,7 +29,16 @@ logging.getLogger("adal-python").setLevel(logging.WARN)
 logger = logging.getLogger("azure_ad_sync")
 logger.setLevel(logging.INFO)
 
+STATS = {}   # log entries per type since the last take_stats(): used for the summary line of a run
+
+def take_stats():
+    """Return the counts per log type since the last call, and start counting again."""
+    counts = dict(STATS)
+    STATS.clear()
+    return counts
+
 def write_log_json_data(action,data):
+    STATS[action] = STATS.get(action, 0) + 1
     logger.info(json.dumps({'type':action,'timestamp': str(datetime.datetime.utcnow()),'data':data}))
 
 def generate_password(length=127):
@@ -38,6 +47,8 @@ def generate_password(length=127):
     password += random.choices(string.ascii_letters + string.digits + special_chars, k=length - 4)
     random.shuffle(password)
     return ''.join(password)
+
+_identity_checked = False   # once per process: the permissions of a new Entra application were verified
 
 class AdConnect():
 
@@ -55,7 +66,7 @@ class AdConnect():
         self.use_get_syncobjects = True
 
         self.az = None
-        self._identity_confirmed = False   # internal: permissions of the new app verified
+        self.confirmations = 2   # full passes in a row needed by the check of a new application
         self.dict_az_user={}
         self.dict_az_group={}
         self.dict_az_devices={}
@@ -64,42 +75,42 @@ class AdConnect():
     def enable_ad_sync(self):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.set_adsyncenabled(enabledirsync=True))
+            self.az.set_adsyncenabled(enabledirsync=True)
 
     def set_desktop_sso_enabled(self):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.set_desktop_sso_enabled(enable=True))
+            self.az.set_desktop_sso_enabled(enable=True)
 
     def set_desktop_sso(self, domain_name: str, password: str, computer_name: str = "AZUREADSSOACC", enable: bool = True):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.set_desktop_sso(domain_name, password, computer_name, enable))
+            self.az.set_desktop_sso( domain_name, password, computer_name, enable)
 
     def enable_password_hash_sync(self):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.set_sync_features(enable_features=['PasswordHashSync']))
+            self.az.set_sync_features(enable_features=['PasswordHashSync'])
 
     def send_obj_to_az(self,entry):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.set_azureadobject(**entry))
+            self.az.set_azureadobject(**entry)
 
     def delete_user(self,entry):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='User'))
+            self.az.remove_azureadoject(sourceanchor=entry,objecttype='User')
 
     def delete_group(self,entry):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='Group'))
+            self.az.remove_azureadoject(sourceanchor=entry,objecttype='Group')
 
     def delete_device(self,entry):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='Device'))
+            self.az.remove_azureadoject(sourceanchor=entry,objecttype='Device')
 
     def generate_all_dict(self):
         self.connect()
@@ -107,9 +118,7 @@ class AdConnect():
         self.dict_az_group = {}
         self.dict_az_devices = {}
 
-        users = self._with_retry(lambda: list(self.az.list_users(
-            select="onPremisesImmutableId,userPrincipalName,onPremisesSyncEnabled")))
-        for user in users:
+        for user in self.az.list_users(select="onPremisesImmutableId,userPrincipalName,onPremisesSyncEnabled"):
             if not user.get('onPremisesImmutableId'):
                 continue
             if not user.get('onPremisesSyncEnabled'):
@@ -120,8 +129,7 @@ class AdConnect():
             return
 
         try:
-            list_groups = self._with_retry(lambda: list(
-                self.az.list_groups(include_immutable_id=True, select="id")))
+            list_groups = self.az.list_groups(include_immutable_id=True, select="id")
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 list_groups = []
@@ -136,7 +144,7 @@ class AdConnect():
         if not self.sync_device:
             return
         try:
-            anchors = self._with_retry(lambda: self.az.get_dict_cloudanchor_sourceanchor())
+            anchors = self.az.get_dict_cloudanchor_sourceanchor()
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 anchors ={}
@@ -151,11 +159,12 @@ class AdConnect():
     def send_hashnt(self,hashnt,sourceanchor):
         self.connect()
         if not self.dry_run:
-            self._with_retry(lambda: self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor))
+            self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor)
 
     def get_sync_configuration(self):
-        """Read the sync configuration (see _with_retry for "not yet" answers)."""
-        return self._with_retry(lambda: self.az.get_syncconfiguration())
+        """Read the sync configuration."""
+        self.connect()
+        return self.az.get_syncconfiguration()
 
     def _new_client(self):
         client = AADInternals(proxies=self.proxiesconf,
@@ -167,32 +176,16 @@ class AdConnect():
         return client
 
     def connect(self):
-        """Create the client once and make sure a newly created Entra application is
-        usable. The wait runs only until it succeeded once (internal flag)."""
+        """Create the client once. The first connection of the process also checks that a
+        newly created Entra application is usable (see _wait_for_new_identity); later
+        connections, and the later cycles of a service, do not check again."""
+        global _identity_checked
         if not self.az:
             self.az = self._new_client()
             self.tenant_id = self.az.tenant_id
-        if not self._identity_confirmed:
+        if not _identity_checked:
             self._wait_for_new_identity()
-            self._identity_confirmed = True
-
-    def _with_retry(self, call, attempts=3, pause_seconds=15):
-        """Run one Entra call. connect() has confirmed the new application once, but
-        Entra answers "not yet" again now and then (replicas that have not caught up).
-        For an application created in the last hour such an answer starts the central
-        wait again and repeats the call, at most `attempts` times in total. Other
-        errors, and older applications, are raised at once. `call` must be safe to
-        repeat, and must read self.az when it runs (the wait replaces the client)."""
-        for attempt in range(1, attempts + 1):
-            self.connect()
-            try:
-                return call()
-            except Exception as exc:
-                if attempt == attempts \
-                        or not (self._permission_pending(exc) and self._identity_is_new()):
-                    raise
-            self._identity_confirmed = False
-            time.sleep(pause_seconds)
+            _identity_checked = True
 
     def _identity_is_new(self, max_age_minutes=60):
         try:
@@ -210,39 +203,53 @@ class AdConnect():
             return True
         return getattr(getattr(exc, "response", None), "status_code", None) in (401, 403)
 
+    def _pending_permissions(self):
+        """Names of the services that still answer "not yet" (empty list: all three work)."""
+        probes = [
+            {"name": "directory sync service", "call": lambda: self.az.get_syncconfiguration()},
+            {"name": "groups (Graph)", "call": lambda: self.az.call_graphapi("groups", select="id", top=1)},
+            {"name": "users (Graph)", "call": lambda: self.az.call_graphapi("users", select="id", top=1)},
+        ]
+        pending = []
+        for probe in probes:
+            try:
+                probe["call"]()
+            except Exception as exc:
+                if not self._permission_pending(exc):
+                    raise
+                pending.append(probe["name"])
+        return pending
+
     def _wait_for_new_identity(self, timeout_minutes=30, interval_seconds=30):
         """A newly created Entra application is not usable at once: for some minutes the
-        sync service answers "denied" and Graph answers 403. Wait until all three calls the
-        sync needs work. Only for an application created in the last hour. Every attempt
-        uses a NEW client, because msal keeps the first access token in memory and that
-        token may have been issued before the roles reached the token service."""
+        sync service answers "denied" and Graph answers 401/403, per service and per request.
+        Wait until all three work in the SAME round. With confirmations=2 (initial run) that
+        has to happen twice in a row, interval_seconds apart; a failed round starts the count
+        again. A service uses confirmations=1. Only for an application created in the last
+        hour. Every round uses a NEW client, because msal keeps the first token in memory."""
         if not self._identity_is_new():
             return
         deadline = time.monotonic() + timeout_minutes * 60
+        passed = 0
         attempt = 0
         while True:
-            probes = [
-                {"name": "directory sync service", "call": lambda: self.az.get_syncconfiguration()},
-                {"name": "groups (Graph)", "call": lambda: self.az.call_graphapi("groups", select="id", top=1)},
-                {"name": "users (Graph)", "call": lambda: self.az.call_graphapi("users", select="id", top=1)},
-            ]
-            pending = []
-            for probe in probes:
-                try:
-                    probe["call"]()
-                except Exception as exc:
-                    if not self._permission_pending(exc):
-                        raise
-                    pending.append(probe["name"])
+            pending = self._pending_permissions()
             if not pending:
-                return
+                passed += 1
+                if passed >= self.confirmations:
+                    return
+                print("All permissions of the new application answer. Checking again in %d seconds "
+                      "to confirm ..." % interval_seconds, flush=True)
+            else:
+                passed = 0
+                attempt += 1
+                print("Entra is still applying the permissions of the new application "
+                      "(attempt %d, waiting for: %s), retrying in %d seconds ..."
+                      % (attempt, ", ".join(pending), interval_seconds), flush=True)
             if time.monotonic() >= deadline:
                 raise RuntimeError("Entra has not activated the permissions of the new application "
-                                   "after %d minutes (still pending: %s)" % (timeout_minutes, ", ".join(pending)))
-            attempt += 1
-            print("Entra is still applying the permissions of the new application "
-                  "(attempt %d, waiting for: %s), retrying in %d seconds ..."
-                  % (attempt, ", ".join(pending), interval_seconds), flush=True)
+                                   "after %d minutes (still pending: %s)"
+                                   % (timeout_minutes, ", ".join(pending) or "none, confirmation failed"))
             time.sleep(interval_seconds)
             self.az = self._new_client()
 

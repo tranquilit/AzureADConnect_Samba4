@@ -14,7 +14,7 @@ from peewee import SqliteDatabase,CharField,Model,TextField,DateTimeField
 if "__file__" in locals():
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-from libsync import AdConnect,SambaInfo,write_log_json_data,logger,logging,generate_password
+from libsync import AdConnect,SambaInfo,write_log_json_data,take_stats,logger,logging,generate_password
 
 class FatalSyncError(RuntimeError):
     """Needs operator action; retrying cannot help."""
@@ -82,6 +82,30 @@ class AzureObject(Model):
 def hash_for_data(data):
     return hashlib.sha1(pickle.dumps(data)).hexdigest()
 
+tenant_sync_confirmed = False
+
+def ensure_tenant_sync(azure, hash_synchronization):
+    """Switch DirSync and password hash sync on in the tenant when they are off.
+    The tenant is asked once per process: a service does not repeat this call every
+    cycle (each call is one more chance for Entra to answer "not yet"); a restart
+    asks again. A failure leaves the check open, so the next cycle repeats it."""
+    global tenant_sync_confirmed
+    if tenant_sync_confirmed:
+        return
+    sync_conf = azure.get_sync_configuration()
+    if str(sync_conf['IsDirSyncing']).lower() != 'true':
+        if not dry_run and not sys.stdin.isatty():
+            raise FatalSyncError('DirSync is not enabled for this tenant; run the script once interactively to enable it.')
+        # enable ad sync
+        azure.enable_ad_sync()
+        write_log_json_data('enable_ad_sync',{"EnableDirSync":True})
+
+    # enable password hash sync
+    if hash_synchronization and not (int(sync_conf['DirSyncFeatures']) & 1): # 1 = PasswordHashSync
+        azure.enable_password_hash_sync()
+        write_log_json_data('enable_password_hash_sync',{"PasswordHashSync":True})
+    tenant_sync_confirmed = True
+
 def run_sync(force=False,from_db=False):
 
     global config
@@ -98,6 +122,7 @@ def run_sync(force=False,from_db=False):
 
     azure = AdConnect(entra_aba_dir=config.get("common", "entra_aba_dir", fallback="/root/entra_aba"))
     azure.dry_run = dry_run
+    azure.confirmations = 1 if args.servicemode else 2   # new Entra application: passes needed in a row
     azure.sync_device = sync_device
     if config.get('common', 'proxy'):
         azure.proxiesconf = {'http':config.get('common', 'proxy'),'https':config.get('common','proxy')}
@@ -222,19 +247,7 @@ def run_sync(force=False,from_db=False):
 
     if not AzureObject.table_exists():
         db.create_tables([AzureObject])
-    sync_conf = azure.get_sync_configuration()
-    if str(sync_conf['IsDirSyncing']).lower() != 'true':
-        if not dry_run and not sys.stdin.isatty():
-            raise FatalSyncError('DirSync is not enabled for this tenant; run the script once interactively to enable it.')
-        # enable ad sync
-        azure.enable_ad_sync()
-        write_log_json_data('enable_ad_sync',{"EnableDirSync":True})
-
-    # enable password hash sync
-    if hash_synchronization and not (int(sync_conf['DirSyncFeatures']) & 1): # 1 = PasswordHashSync
-        azure.enable_password_hash_sync()
-        write_log_json_data('enable_password_hash_sync',{"PasswordHashSync":True})
-
+    ensure_tenant_sync(azure, hash_synchronization)
 
     if enable_single_sign_on:
 
@@ -483,24 +496,45 @@ def run_sync(force=False,from_db=False):
     if callback_end_synchro != None:
         callback_end_synchro(sambaobj=smb.samdb_loc,az=azure.az,dry_run=dry_run)
 
+def report_run(announce):
+    """One line on the console / in the journal when a run is over. Real log entries go
+    to the logfile only, so without this a finished run looks like a run that did nothing.
+    In service mode, quiet cycles (nothing sent, nothing failed) stay quiet, except
+    the first one and the first one after a failure (announce)."""
+    counts = take_stats()
+    if args.servicemode and not announce and not counts:
+        return
+    text = ", ".join("%s=%d" % (name, counts[name]) for name in sorted(counts)) or "nothing to send"
+    if counts.get('error'):
+        text += " - see %s" % logfile
+    print("Sync run finished%s: %s" % (" (dry run)" if dry_run else "", text), flush=True)
+
 if __name__ == '__main__':
     retry_delay = synchronization_interval_service
+    announce = True      # say something after the start and after a failure, even if nothing was sent
     try:
         while True:
             try:
                 run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync)
                 retry_delay = synchronization_interval_service
-            except FatalSyncError:
+                report_run(announce)
+                announce = False
+            except FatalSyncError as exc:
                 write_log_json_data(
                     "fatal",
                     traceback.format_exc()
                 )
+                print("Fatal: %s" % exc, file=sys.stderr, flush=True)
                 sys.exit(2)
-            except Exception:
+            except Exception as exc:
                 write_log_json_data("error",traceback.format_exc())
                 if not args.servicemode :
                     raise
                 retry_delay = min(retry_delay * 2, 3600)
+                print("Sync run failed: %s: %s (details in %s), next try in %d seconds"
+                      % (type(exc).__name__, exc, logfile, retry_delay), file=sys.stderr, flush=True)
+                take_stats()
+                announce = True
             if not args.servicemode :
                 break
             calculate_deletions_based_on_last_sync = True

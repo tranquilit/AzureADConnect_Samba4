@@ -8,12 +8,16 @@ import datetime
 import logging
 import random
 import string
+import time
 
 from samba.auth import system_session
 from samba.credentials import Credentials
 from samba.samdb import SamDB
 from samba import param
 from AADInternals_python.AADInternals import AADInternals, SYNC_SCOPE
+
+from pathlib import Path
+from AADInternals_python._aad_certificate_manager import read_state
 
 from samba.dsdb import UF_ACCOUNTDISABLE
 from AdAccountReader import AdAccountReader
@@ -22,7 +26,6 @@ import optparse
 import samba.getopt as options
 
 logging.getLogger("adal-python").setLevel(logging.WARN)
-
 logger = logging.getLogger("azure_ad_sync")
 logger.setLevel(logging.INFO)
 
@@ -49,31 +52,19 @@ class AdConnect():
 
         self.dry_run=True
         self.sync_device=False
-        use_get_syncobjects = True
+        self.use_get_syncobjects = True
 
         self.az = None
+        self._identity_confirmed = False   # internal: permissions of the new app verified
         self.dict_az_user={}
         self.dict_az_group={}
         self.dict_az_devices={}
         self.verify=True
 
-    def connect(self):
-        if not self.az:
-            self.az = AADInternals(proxies=self.proxiesconf,
-                                   tenant_id=self.tenant_id,
-                                   entra_aba_dir=self.entra_aba_dir,
-                                   domain=self.domain,
-                                   verify=self.verify)
-            self.az.get_token(scopes=[SYNC_SCOPE])
-            self.tenant_id = self.az.tenant_id
-
-
     def enable_ad_sync(self):
         self.connect()
-        if self.dry_run:
-            return
-        self.az.set_adsyncenabled(enabledirsync=True)
-        
+        if not self.dry_run:
+            self.az.set_adsyncenabled(enabledirsync=True)
 
     def set_desktop_sso_enabled(self):
         self.connect()
@@ -139,26 +130,120 @@ class AdConnect():
                 continue
             self.dict_az_group[group["onPremisesImmutableId"]] = group
 
-        return None
+        if not self.sync_device:
+            return
         try:
-            list_devices = self.az.list_devices(select="onPremisesImmutableId,id")
+            anchors = self.az.get_dict_cloudanchor_sourceanchor()
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
-                list_devices = []
+                anchors ={}
             else:
                 raise
-
-        if self.sync_device:
-            for device in list_devices:
-                if not device.get('onPremisesImmutableId'):
-                    continue
-                self.dict_az_devices[user["onPremisesImmutableId"]] = device
+        for cloudanchor, sourceanchor in anchors.items():
+            if cloudanchor.startswith('Device_'):
+                self.dict_az_devices[sourceanchor] ={
+                    'id': cloudanchor[len('Device_'):], 'onPremisesImmutableId': sourceanchor
+                }
 
     def send_hashnt(self,hashnt,sourceanchor):
         self.connect()
         if not self.dry_run:
             self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor)
 
+    def get_sync_configuration(self):
+        """Read the sync configuration. A new Entra application may need some minutes
+        before it works; connect() waits for that. If the service answers "not yet"
+        although the wait was already done (a replica that has not caught up), wait
+        again, once, with fresh clients - only for a newly created application."""
+        self.connect()
+        try:
+            return self.az.get_syncconfiguration()
+        except Exception as exc:
+            if not (self._permission_pending(exc) and self._identity_is_new()):
+                raise
+        self._identity_confirmed = False
+        self.connect()
+        return self.az.get_syncconfiguration()
+
+    def _new_client(self):
+        client = AADInternals(proxies=self.proxiesconf,
+                              tenant_id=self.tenant_id,
+                              entra_aba_dir=self.entra_aba_dir,
+                              domain=self.domain,
+                              verify=self.verify)
+        client.get_token(scopes=[SYNC_SCOPE])
+        return client
+
+    def connect(self):
+        """Create the client once and make sure a newly created Entra application is
+        usable. The wait runs only until it succeeded once (internal flag)."""
+        if not self.az:
+            self.az = self._new_client()
+            self.tenant_id = self.az.tenant_id
+        if not self._identity_confirmed:
+            self._wait_for_new_identity()
+            self._identity_confirmed = True
+
+    def _identity_is_new(self, max_age_minutes=60):
+        try:
+            with open(os.path.join(self.entra_aba_dir, "state.json"), encoding="utf-8") as stream:
+                created = datetime.datetime.fromisoformat(
+                    json.load(stream)["created_at"].replace("Z", "+00:00"))
+        except (OSError, ValueError, KeyError):
+            return False
+        return datetime.datetime.now(datetime.timezone.utc) - created < datetime.timedelta(minutes=max_age_minutes)
+
+    @staticmethod
+    def _permission_pending(exc):
+        """True for the two ways Entra says "not yet": SOAP fault 'denied' and Graph 403."""
+        if "Access to Azure Active Directory has been denied" in str(exc):
+            return True
+        return getattr(getattr(exc, "response", None), "status_code", None) in (401, 403)
+
+    def _wait_for_new_identity(self, timeout_minutes=30, interval_seconds=30):
+        """A newly created Entra application is not usable at once: for some minutes the
+        sync service answers "denied" and Graph answers 403. Wait until all three calls the
+        sync needs work. Only for an application created in the last hour. Every attempt
+        uses a NEW client, because msal keeps the first access token in memory and that
+        token may have been issued before the roles reached the token service."""
+        if not self._identity_is_new():
+            return
+        deadline = time.monotonic() + timeout_minutes * 60
+        attempt = 0
+        while True:
+            probes = [
+                {"name": "directory sync service", "call": lambda: self.az.get_syncconfiguration()},
+                {"name": "groups (Graph)", "call": lambda: self.az.call_graphapi("groups", select="id", top=1)},
+                {"name": "users (Graph)", "call": lambda: self.az.call_graphapi("users", select="id", top=1)},
+            ]
+            pending = []
+            for probe in probes:
+                try:
+                    probe["call"]()
+                except Exception as exc:
+                    if not self._permission_pending(exc):
+                        raise
+                    pending.append(probe["name"])
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Entra has not activated the permissions of the new application "
+                                   "after %d minutes (still pending: %s)" % (timeout_minutes, ", ".join(pending)))
+            attempt += 1
+            print("Entra is still applying the permissions of the new application "
+                  "(attempt %d, waiting for: %s), retrying in %d seconds ..."
+                  % (attempt, ", ".join(pending), interval_seconds), flush=True)
+            time.sleep(interval_seconds)
+            self.az = self._new_client()
+
+    def identity_ready(self):
+        base = Path(self.entra_aba_dir).expanduser().resolve()
+        state = read_state(base)
+        if not state or state.get('status') != 'ready':
+            return False
+        if self.tenant_id and state.get('tenant_id') != self.tenant_id:
+            return False
+        return (base / 'current.pfx').exists()
 
 class SambaInfo():
 
@@ -179,7 +264,7 @@ class SambaInfo():
 
         creds = Credentials()
         creds.guess(lp)
-        
+
         self.user = None
         if user or password:
             creds.set_username(user)
@@ -327,7 +412,19 @@ ms-DS-ConsistencyGuid:: %s
 
         return decode_SourceAnchor
 
-
+    def _manager_anchor(self, user):
+        if not user.get('manager'):
+            return ''
+        res = self.samdb_loc.search(
+            base=user['manager'][0].decode('utf-8'), scope=ldb.SCOPE_BASE,
+            attrs=[
+                self.SourceAnchorAttr,
+                'objectSID',
+                'distinguishedName',
+                'ms-DS-ConsistencyGuid'
+            ]
+        )
+        return self.return_source_anchor(res[0]) if res else ''
 
     def generate_all_dict(self):
         self.dict_all_users_samba={}
@@ -352,7 +449,8 @@ ms-DS-ConsistencyGuid:: %s
                     hashnt = hashnt.hex().upper()
             else:
                 passwordattr = 'unicodePwd'
-                password = self.samdb_loc.search(self.samdb_loc.get_default_basedn(),expression="(sAMAccountName=%s)" % str(user["sAMAccountName"]) ,scope=ldb.SCOPE_SUBTREE,attrs=[passwordattr])[0]
+                password = self.samdb_loc.search(self.samdb_loc.get_default_basedn(),expression="(sAMAccountName=%s)" % ldb.binary_encode(str(user["sAMAccountName"])) ,scope=ldb.SCOPE_SUBTREE,attrs=[passwordattr])[0]
+
                 if not passwordattr in password:
                     continue
                 hashnt = password[passwordattr][0].hex().upper()
@@ -380,7 +478,8 @@ ms-DS-ConsistencyGuid:: %s
                        "onPremisesSamAccountName"   : user.get("sAMAccountName",[b''])[0].decode('utf-8'),
                        "onPremisesDistinguishedName": str(user["dn"]),
                        "dnsDomainName"              : self.domaine,
-                       "manager"                    : self.return_source_anchor(self.samdb_loc.search(self.samdb_loc.get_default_basedn(),expression="(distinguishedName=%s)" % user.get("manager")[0].decode('utf-8'),attrs=[self.SourceAnchorAttr,'objectSID','distinguishedName','ms-DS-ConsistencyGuid'])[0]) if user.get("manager") else ''  ,
+                       #"manager"                    : self.return_source_anchor(self.samdb_loc.search(self.samdb_loc.get_default_basedn(),expression="(distinguishedName=%s)" % user.get("manager")[0].decode('utf-8'),attrs=[self.SourceAnchorAttr,'objectSID','distinguishedName','ms-DS-ConsistencyGuid'])[0]) if user.get("manager") else ''  ,
+                       "manager"                    : self._manager_anchor(user) ,
                        "displayName"                : user.get("displayName",[b''])[0].decode('utf-8'),
                        "onPremiseSecurityIdentifier": base64.b64encode(user["objectSid"][0]).decode('utf-8'),
                        "userCertificate"            : [base64.b64encode(c).decode('utf-8') for c in user.get("userCertificate",[])],
@@ -417,9 +516,11 @@ ms-DS-ConsistencyGuid:: %s
                         if not dn in dict_mail_dn[m]:
                             dict_mail_dn[m][dn] = []
                         dict_mail_dn[m][dn].append(testmail)
-     
+
             if self.callback_calculated_user != None:
                 data = self.callback_calculated_user(sambaobj=self.samdb_loc,entry=user,result=data)
+                if not data:
+                    continue
                 SourceAnchor = data['SourceAnchor']
 
             if not SourceAnchor:
@@ -468,6 +569,8 @@ ms-DS-ConsistencyGuid:: %s
 
                 if self.callback_calculated_device != None:
                     data = self.callback_calculated_device(sambaobj=self.samdb_loc,entry=device,result=data)
+                    if not data:
+                        continue
                     SourceAnchor = data['SourceAnchor']
 
                 if not data:
@@ -507,6 +610,8 @@ ms-DS-ConsistencyGuid:: %s
 
             if self.callback_calculated_group != None:
                 data = self.callback_calculated_group(sambaobj=self.samdb_loc,entry=group,result=data)
+                if not data:
+                    continue
                 SourceAnchor = data['SourceAnchor']
 
             if not data:

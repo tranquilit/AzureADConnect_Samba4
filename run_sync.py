@@ -16,6 +16,9 @@ if "__file__" in locals():
 
 from libsync import AdConnect,SambaInfo,write_log_json_data,logger,logging,generate_password
 
+class FatalSyncError(RuntimeError):
+    """Needs operator action; retrying cannot help."""
+
 parser = argparse.ArgumentParser(description='Azure ad sync')
 parser.add_argument('--conf', dest='azureconf', default='/etc/azureconf/azure.conf',help='path to conf file')
 parser.add_argument('--service-mode', action=argparse.BooleanOptionalAction,dest='servicemode',help='Run the script in service mode',default=False)
@@ -64,7 +67,6 @@ elif logfile:
 else:
     handler = logging.StreamHandler(sys.stderr)
 logging.basicConfig(level=logging.WARNING, format='%(message)s', handlers=[handler], force=True)
-
 
 class AzureObject(Model):
     sourceanchor = CharField(primary_key=True, index=True)
@@ -117,6 +119,16 @@ def run_sync(force=False,from_db=False):
 
     if config.has_option('common', 'azureadname'):
         azure.domain = config.get('common', 'azureadname')
+
+    # check if identity is ready
+    if not azure.identity_ready():
+        if dry_run or not sys.stdin.isatty():
+            raise FatalSyncError(
+                f'Entra application identity in {azure.entra_aba_dir} is not initialised (or belongs to another tenant). '
+                'Run once interactively without --dryrun, or: '
+                'python3 AADInternals_python/_aad_certificate_manager.py bootstrap '
+                f'--tenant-id <GUID> --state-dir {azure.entra_aba_dir} --apply'
+            )
 
     if config.has_option('common', 'enable_single_sign_on'):
         enable_single_sign_on = config.getboolean('common', 'enable_single_sign_on')
@@ -210,16 +222,18 @@ def run_sync(force=False,from_db=False):
 
     if not AzureObject.table_exists():
         db.create_tables([AzureObject])
-
-    if AzureObject.select(AzureObject.sourceanchor).first() == None :
+    sync_conf = azure.get_sync_configuration()
+    if str(sync_conf['IsDirSyncing']).lower() != 'true':
+        if not dry_run and not sys.stdin.isatty():
+            raise FatalSyncError('DirSync is not enabled for this tenant; run the script once interactively to enable it.')
         # enable ad sync
         azure.enable_ad_sync()
         write_log_json_data('enable_ad_sync',{"EnableDirSync":True})
 
-        # enable password hash sync
-        if hash_synchronization :
-            azure.enable_password_hash_sync()
-            write_log_json_data('enable_password_hash_sync',{"PasswordHashSync":True})
+    # enable password hash sync
+    if hash_synchronization and not (int(sync_conf['DirSyncFeatures']) & 1): # 1 = PasswordHashSync
+        azure.enable_password_hash_sync()
+        write_log_json_data('enable_password_hash_sync',{"PasswordHashSync":True})
 
 
     if enable_single_sign_on:
@@ -435,6 +449,8 @@ def run_sync(force=False,from_db=False):
         for entry in smb.dict_id_hash :
             sha2password= hash_for_data(smb.dict_id_hash[entry])
             last_data =  AzureObject.select(AzureObject.last_sha256_hashnt_send).where(AzureObject.sourceanchor==entry,AzureObject.object_type=='user').first()
+            if entry in dict_error and not last_data:
+                continue
             if force or (not last_data) or last_data.last_sha256_hashnt_send != sha2password :
                 # Microsoft is very slow between sending the account and sending the password
                 try:
@@ -468,16 +484,26 @@ def run_sync(force=False,from_db=False):
         callback_end_synchro(sambaobj=smb.samdb_loc,az=azure.az,dry_run=dry_run)
 
 if __name__ == '__main__':
-    while True:
-        try:
-            run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync)
-        except:
-            write_log_json_data("error",traceback.format_exc())
+    retry_delay = synchronization_interval_service
+    try:
+        while True:
+            try:
+                run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync)
+                retry_delay = synchronization_interval_service
+            except FatalSyncError:
+                write_log_json_data(
+                    "fatal",
+                    traceback.format_exc()
+                )
+                sys.exit(2)
+            except Exception:
+                write_log_json_data("error",traceback.format_exc())
+                if not args.servicemode :
+                    raise
+                retry_delay = min(retry_delay * 2, 3600)
             if not args.servicemode :
-                raise
-        if not args.servicemode :
-            break
-        calculate_deletions_based_on_last_sync = True
-        time.sleep(synchronization_interval_service)
-
-db.close()
+                break
+            calculate_deletions_based_on_last_sync = True
+            time.sleep(retry_delay)
+    finally:
+        db.close()

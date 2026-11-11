@@ -14,7 +14,7 @@ from samba.auth import system_session
 from samba.credentials import Credentials
 from samba.samdb import SamDB
 from samba import param
-from AADInternals_python.AADInternals import AADInternals, SYNC_SCOPE
+from AADInternals_python.AADInternals import AADInternals, SYNC_SCOPE, GRAPH_SCOPE
 
 from pathlib import Path
 from AADInternals_python._aad_certificate_manager import read_state
@@ -33,6 +33,12 @@ logger = logging.getLogger("azure_ad_sync")
 logger.setLevel(logging.INFO)
 
 STATS = {}   # log entries per type since the last take_stats(): used for the summary line of a run
+
+PROBES = [
+    {'name': 'directory sync service', 'scope': SYNC_SCOPE,  'permissions': ['ADSynchronization.ReadWrite.All']},
+    {'name': 'groups (Graph)',         'scope': GRAPH_SCOPE, 'permissions': ['Group.Read.All']},
+    {'name': 'users (Graph)',          'scope': GRAPH_SCOPE, 'permissions': ['User.Read.All']},
+]
 
 def take_stats():
     """Return the counts per log type since the last call, and start counting again."""
@@ -236,24 +242,25 @@ class AdConnect():
                       "retrying in %d seconds ..." % (name, attempt, tries, delay), flush=True)
                 time.sleep(delay)
                 delay *= 2
-                self.az = self._new_client()
+                #self.az = self._new_client()
+                self.az.refresh_confidential_client_app()
 
 
     def _pending_permissions(self) -> list[str]:
-        """Names of the services that still answer "not yet" (empty list: all three work)."""
-        probes = [
-            {"name": "directory sync service", "call": lambda: self.az.get_syncconfiguration()},
-            {"name": "groups (Graph)", "call": lambda: self.az.call_graphapi("groups", select="id", top=1)},
-            {"name": "users (Graph)", "call": lambda: self.az.call_graphapi("users", select="id", top=1)},
-        ]
+        claims_by_scope = {}
         pending = []
-        for probe in probes:
-            try:
-                probe["call"]()
-            except Exception as exc:
-                if not self._permission_pending(exc):
-                    raise
-                pending.append(probe["name"])
+        for probe in PROBES:
+            scope = probe['scope']
+            if scope not in claims_by_scope:   # one token per scope
+                claims_by_scope[scope] = self.az.get_token_claims(scopes=[scope])
+            claims = claims_by_scope[scope]
+            granted = claims.get('roles') or []
+            missing = [perm for perm in probe['permissions'] if perm not in granted]
+            if missing:
+                print(f'{probe["name"]} has missing permission(s): {missing}. Right now token has {granted} permissions granted.', flush=True)
+                # '%s: missing %s, token has %s (uti %s)'
+                # % (probe['name'], ', '.join(missing), granted, claims.get('uti')), flush=True)
+                pending.append(probe['name'])
         return pending
 
     def _wait_for_new_identity(self, timeout_minutes=30, interval_seconds=30) -> None:
@@ -272,22 +279,24 @@ class AdConnect():
             pending = self._pending_permissions()
             if not pending:
                 passed += 1
-                if passed >= self.confirmations:
-                    return
+                # if passed >= self.confirmations:
+                #     return
                 print("All permissions of the new application answer. Checking again in %d seconds "
                       "to confirm ..." % interval_seconds, flush=True)
+                return
             else:
                 passed = 0
                 attempt += 1
-                print("Entra is still applying the permissions of the new application "
-                      "(attempt %d, waiting for: %s), retrying in %d seconds ..."
-                      % (attempt, ", ".join(pending), interval_seconds), flush=True)
+                # print("Entra is still applying the permissions of the new application "
+                #       "(attempt %d, waiting for: %s), retrying in %d seconds ..."
+                #       % (attempt, ", ".join(pending), interval_seconds), flush=True)
             if time.monotonic() >= deadline:
                 raise RuntimeError("Entra has not activated the permissions of the new application "
                                    "after %d minutes (still pending: %s)"
                                    % (timeout_minutes, ", ".join(pending) or "none, confirmation failed"))
             time.sleep(interval_seconds)
-            self.az = self._new_client()
+            #self.az = self._new_client()
+            self.az.refresh_confidential_client_app()
 
 
     def identity_ready(self) -> bool:

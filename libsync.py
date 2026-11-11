@@ -25,6 +25,9 @@ from AdAccountReader import AdAccountReader
 import optparse
 import samba.getopt as options
 
+from typing import Any
+from typing import Callable
+
 logging.getLogger("adal-python").setLevel(logging.WARN)
 logger = logging.getLogger("azure_ad_sync")
 logger.setLevel(logging.INFO)
@@ -50,6 +53,9 @@ def generate_password(length=127):
 
 _identity_checked = False   # once per process: the permissions of a new Entra application were verified
 
+class PermissionsMissing(RuntimeError):
+    """Entra still refuses the application after all tries: permissions not there (yet)."""
+
 class AdConnect():
 
     def __init__(self, entra_aba_dir="/root/entra_aba"):
@@ -67,6 +73,8 @@ class AdConnect():
 
         self.az = None
         self.confirmations = 2   # full passes in a row needed by the check of a new application
+        self.retry_delay = 15    # seconds before the 2nd try of a refused call; doubles after each refusal
+        self.retry_count = 6     # tries in total before PermissionsMissing
         self.dict_az_user={}
         self.dict_az_group={}
         self.dict_az_devices={}
@@ -75,42 +83,42 @@ class AdConnect():
     def enable_ad_sync(self):
         self.connect()
         if not self.dry_run:
-            self.az.set_adsyncenabled(enabledirsync=True)
+            self._call('enable DirSync', lambda: self.az.set_adsyncenabled(enabledirsync=True))
 
     def set_desktop_sso_enabled(self):
         self.connect()
         if not self.dry_run:
-            self.az.set_desktop_sso_enabled(enable=True)
+            self._call('enable seamless SSO', lambda: self.az.set_desktop_sso_enabled(enable=True))
 
     def set_desktop_sso(self, domain_name: str, password: str, computer_name: str = "AZUREADSSOACC", enable: bool = True):
         self.connect()
         if not self.dry_run:
-            self.az.set_desktop_sso( domain_name, password, computer_name, enable)
+            self._call('set seamless SSO', lambda: self.az.set_desktop_sso( domain_name, password, computer_name, enable))
 
     def enable_password_hash_sync(self):
         self.connect()
         if not self.dry_run:
-            self.az.set_sync_features(enable_features=['PasswordHashSync'])
+            self._call('enable password hash sync', lambda: self.az.set_sync_features(enable_features=['PasswordHashSync']))
 
     def send_obj_to_az(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.set_azureadobject(**entry)
+            self._call('send object', lambda: self.az.set_azureadobject(**entry))
 
     def delete_user(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.remove_azureadoject(sourceanchor=entry,objecttype='User')
+            self._call('delete user', lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='User'))
 
     def delete_group(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.remove_azureadoject(sourceanchor=entry,objecttype='Group')
+            self._call('delete group', lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='Group'))
 
     def delete_device(self,entry):
         self.connect()
         if not self.dry_run:
-            self.az.remove_azureadoject(sourceanchor=entry,objecttype='Device')
+            self._call('delete device', lambda: self.az.remove_azureadoject(sourceanchor=entry,objecttype='Device'))
 
     def generate_all_dict(self):
         self.connect()
@@ -118,7 +126,9 @@ class AdConnect():
         self.dict_az_group = {}
         self.dict_az_devices = {}
 
-        for user in self.az.list_users(select="onPremisesImmutableId,userPrincipalName,onPremisesSyncEnabled"):
+
+        list_users = self._call('list users (Graph)', lambda: self.az.list_users(select="onPremisesImmutableId,userPrincipalName,onPremisesSyncEnabled"))
+        for user in list_users:
             if not user.get('onPremisesImmutableId'):
                 continue
             if not user.get('onPremisesSyncEnabled'):
@@ -129,7 +139,8 @@ class AdConnect():
             return
 
         try:
-            list_groups = self.az.list_groups(include_immutable_id=True, select="id")
+
+            list_groups = self._call('list groups', lambda: self.az.list_groups(include_immutable_id=True, select="id"))
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 list_groups = []
@@ -144,7 +155,7 @@ class AdConnect():
         if not self.sync_device:
             return
         try:
-            anchors = self.az.get_dict_cloudanchor_sourceanchor()
+            anchors = self._call('read sync objects', lambda: self.az.get_dict_cloudanchor_sourceanchor())
         except Exception as e:
             if 'Identity synchronization is not yet activated for this company' in str(e):
                 anchors ={}
@@ -159,14 +170,14 @@ class AdConnect():
     def send_hashnt(self,hashnt,sourceanchor):
         self.connect()
         if not self.dry_run:
-            self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor)
+            self._call('send password hash', lambda: self.az.set_userpassword(hashnt=hashnt,sourceanchor=sourceanchor))
 
     def get_sync_configuration(self):
         """Read the sync configuration."""
         self.connect()
-        return self.az.get_syncconfiguration()
+        return self._call('read sync configuration', lambda: self.az.get_syncconfiguration())
 
-    def _new_client(self):
+    def _new_client(self) -> AADInternals:
         client = AADInternals(proxies=self.proxiesconf,
                               tenant_id=self.tenant_id,
                               entra_aba_dir=self.entra_aba_dir,
@@ -187,7 +198,7 @@ class AdConnect():
             self._wait_for_new_identity()
             _identity_checked = True
 
-    def _identity_is_new(self, max_age_minutes=60):
+    def _identity_is_new(self, max_age_minutes=60) -> bool:
         try:
             with open(os.path.join(self.entra_aba_dir, "state.json"), encoding="utf-8") as stream:
                 created = datetime.datetime.fromisoformat(
@@ -197,13 +208,38 @@ class AdConnect():
         return datetime.datetime.now(datetime.timezone.utc) - created < datetime.timedelta(minutes=max_age_minutes)
 
     @staticmethod
-    def _permission_pending(exc):
+    def _permission_pending(exc) -> bool:
         """True for the two ways Entra says "not yet": SOAP fault 'denied' and Graph 403."""
         if "Access to Azure Active Directory has been denied" in str(exc):
             return True
         return getattr(getattr(exc, "response", None), "status_code", None) in (401, 403)
 
-    def _pending_permissions(self):
+    def _call(self, name, call) -> Any:
+        """Execute one call to Entra. When Entra answers "denied" / 401 / 403 (permissions not
+        active yet, e.g. a new application), wait retry_delay seconds, doubling after each
+        refusal, and try again with a NEW client (msal keeps the old token in memory).
+        After retry_count tries raise PermissionsMissing. Other errors pass through at once."""
+        delay = self.retry_delay
+        tries = max(1, self.retry_count)
+        for attempt in range(1, tries + 1):
+            try:
+                return call()
+            except Exception as exc:
+                if not self._permission_pending(exc):
+                    raise
+                if attempt >= tries:
+                    raise PermissionsMissing(
+                        "Entra refused '%s' %d times: the permissions of the application are not "
+                        "there (yet). A new application can need some minutes; run again later. "
+                        "Last answer: %s" % (name, attempt, exc)) from exc
+                print("Entra refused '%s' (try %d of %d): permissions not active yet, "
+                      "retrying in %d seconds ..." % (name, attempt, tries, delay), flush=True)
+                time.sleep(delay)
+                delay *= 2
+                self.az = self._new_client()
+
+
+    def _pending_permissions(self) -> list[str]:
         """Names of the services that still answer "not yet" (empty list: all three work)."""
         probes = [
             {"name": "directory sync service", "call": lambda: self.az.get_syncconfiguration()},
@@ -220,7 +256,7 @@ class AdConnect():
                 pending.append(probe["name"])
         return pending
 
-    def _wait_for_new_identity(self, timeout_minutes=30, interval_seconds=30):
+    def _wait_for_new_identity(self, timeout_minutes=30, interval_seconds=30) -> None:
         """A newly created Entra application is not usable at once: for some minutes the
         sync service answers "denied" and Graph answers 401/403, per service and per request.
         Wait until all three work in the SAME round. With confirmations=2 (initial run) that
@@ -253,7 +289,8 @@ class AdConnect():
             time.sleep(interval_seconds)
             self.az = self._new_client()
 
-    def identity_ready(self):
+
+    def identity_ready(self) -> bool:
         base = Path(self.entra_aba_dir).expanduser().resolve()
         state = read_state(base)
         if not state or state.get('status') != 'ready':
@@ -495,7 +532,6 @@ ms-DS-ConsistencyGuid:: %s
                        "onPremisesSamAccountName"   : user.get("sAMAccountName",[b''])[0].decode('utf-8'),
                        "onPremisesDistinguishedName": str(user["dn"]),
                        "dnsDomainName"              : self.domaine,
-                       #"manager"                    : self.return_source_anchor(self.samdb_loc.search(self.samdb_loc.get_default_basedn(),expression="(distinguishedName=%s)" % user.get("manager")[0].decode('utf-8'),attrs=[self.SourceAnchorAttr,'objectSID','distinguishedName','ms-DS-ConsistencyGuid'])[0]) if user.get("manager") else ''  ,
                        "manager"                    : self._manager_anchor(user) ,
                        "displayName"                : user.get("displayName",[b''])[0].decode('utf-8'),
                        "onPremiseSecurityIdentifier": base64.b64encode(user["objectSid"][0]).decode('utf-8'),

@@ -14,7 +14,8 @@ from peewee import SqliteDatabase,CharField,Model,TextField,DateTimeField
 if "__file__" in locals():
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-from libsync import AdConnect,SambaInfo,write_log_json_data,take_stats,logger,logging,generate_password
+#from libsync import AdConnect,SambaInfo,write_log_json_data,take_stats,logger,logging,generate_password
+from libsync import AdConnect,SambaInfo,write_log_json_data,take_stats,logger,logging,generate_password,PermissionsMissing
 
 class FatalSyncError(RuntimeError):
     """Needs operator action; retrying cannot help."""
@@ -82,16 +83,16 @@ class AzureObject(Model):
 def hash_for_data(data):
     return hashlib.sha1(pickle.dumps(data)).hexdigest()
 
-tenant_sync_confirmed = False
+#tenant_sync_confirmed = False
 
 def ensure_tenant_sync(azure, hash_synchronization):
     """Switch DirSync and password hash sync on in the tenant when they are off.
     The tenant is asked once per process: a service does not repeat this call every
     cycle (each call is one more chance for Entra to answer "not yet"); a restart
     asks again. A failure leaves the check open, so the next cycle repeats it."""
-    global tenant_sync_confirmed
-    if tenant_sync_confirmed:
-        return
+    # global tenant_sync_confirmed
+    # if tenant_sync_confirmed:
+    #     return
     sync_conf = azure.get_sync_configuration()
     if str(sync_conf['IsDirSyncing']).lower() != 'true':
         if not dry_run and not sys.stdin.isatty():
@@ -104,26 +105,16 @@ def ensure_tenant_sync(azure, hash_synchronization):
     if hash_synchronization and not (int(sync_conf['DirSyncFeatures']) & 1): # 1 = PasswordHashSync
         azure.enable_password_hash_sync()
         write_log_json_data('enable_password_hash_sync',{"PasswordHashSync":True})
-    tenant_sync_confirmed = True
+    #tenant_sync_confirmed = True
 
-def run_sync(force=False,from_db=False):
 
-    global config
-    global db
-
-    global dry_run
-
-    hash_synchronization = config.getboolean('common', 'hash_synchronization')
-
-    sync_device = config.getboolean('common', 'sync_device')
-
-    if dry_run:
-        print('DRY RUN ON: the script will not perform any actions')
-
+def build_azure():
     azure = AdConnect(entra_aba_dir=config.get("common", "entra_aba_dir", fallback="/root/entra_aba"))
     azure.dry_run = dry_run
     azure.confirmations = 1 if args.servicemode else 2   # new Entra application: passes needed in a row
-    azure.sync_device = sync_device
+    azure.retry_delay = config.getint('common', 'permission_retry_delay', fallback=15)   # first wait after a refused call, doubles each time
+    azure.retry_count = config.getint('common', 'permission_retry_count', fallback=6)    # tries before giving up
+    azure.sync_device = config.getboolean('common', 'sync_device')
     if config.get('common', 'proxy'):
         azure.proxiesconf = {'http':config.get('common', 'proxy'),'https':config.get('common','proxy')}
     else:
@@ -145,15 +136,89 @@ def run_sync(force=False,from_db=False):
     if config.has_option('common', 'azureadname'):
         azure.domain = config.get('common', 'azureadname')
 
-    # check if identity is ready
+    return azure
+
+def startup_checks():
+    """Run once at the start of an initial run and of the service: local identity ready,
+    DirSync / password hash sync on. The wait for a new Entra application stays lazy
+    (first AdConnect.connect() of the process, see _wait_for_new_identity). Every call to
+    Entra is retried on refusal (AdConnect._call). Any failure is fatal."""
+    azure = build_azure()
     if not azure.identity_ready():
-        if dry_run or not sys.stdin.isatty():
+        # A dry run also creates the certificate (and later the db): without them nothing works.
+        # It still needs a terminal for the administrator login.
+        #if dry_run or not sys.stdin.isatty():
+        if not sys.stdin.isatty():
             raise FatalSyncError(
                 f'Entra application identity in {azure.entra_aba_dir} is not initialised (or belongs to another tenant). '
-                'Run once interactively without --dryrun, or: '
+                #'Run once interactively without --dryrun, or: '
+                'Run once interactively (with or without --dryrun), or: '
                 'python3 AADInternals_python/_aad_certificate_manager.py bootstrap '
                 f'--tenant-id <GUID> --state-dir {azure.entra_aba_dir} --apply'
             )
+    try:
+        azure.connect()
+        #azure._wait_for_new_identity()     # stays lazy in AdConnect.connect()
+        ensure_tenant_sync(azure, config.getboolean('common', 'hash_synchronization'))
+    except FatalSyncError:
+        raise
+    except PermissionsMissing as exc:
+        raise FatalSyncError(str(exc)) from exc
+    except Exception as exc:
+        raise FatalSyncError('Startup failed: %s' % exc) from exc
+    return azure
+
+#def run_sync(force=False,from_db=False, azure=False):
+def run_sync(force=False,from_db=False,azure=None):
+
+    global config
+    global db
+
+    global dry_run
+
+    hash_synchronization = config.getboolean('common', 'hash_synchronization')
+
+    sync_device = config.getboolean('common', 'sync_device')
+
+    if dry_run:
+        print('DRY RUN ON: the script will not perform any actions')
+
+    # azure = AdConnect(entra_aba_dir=config.get("common", "entra_aba_dir", fallback="/root/entra_aba"))
+    # azure.dry_run = dry_run
+    # azure.confirmations = 1 if args.servicemode else 2   # new Entra application: passes needed in a row
+    # azure.sync_device = sync_device
+    # if config.get('common', 'proxy'):
+    #     azure.proxiesconf = {'http':config.get('common', 'proxy'),'https':config.get('common','proxy')}
+    # else:
+    #     azure.proxiesconf = {}
+
+    # if config.has_option('common', 'verify'):
+    #     if config.get('common', 'verify').lower() in ('true', '1'):
+    #         azure.verify = True
+    #     elif config.get('common', 'verify').lower() in ('false', '0'):
+    #         azure.verify = False
+    #     else:
+    #         azure.verify = config.get('common', 'verify')
+    # else:
+    #     azure.verify = True
+
+    # if config.has_option('common', 'tenant_id'):
+    #     azure.tenant_id = config.get('common', 'tenant_id')
+
+    # if config.has_option('common', 'azureadname'):
+    #    azure.domain = config.get('common', 'azureadname')
+    #azure = build_azure()
+    if azure is None:            # first cycle: reuse the client checked by startup_checks()
+        azure = build_azure()
+    # # check if identity is ready
+    # if not azure.identity_ready():
+    #     if dry_run or not sys.stdin.isatty():
+    #         raise FatalSyncError(
+    #             f'Entra application identity in {azure.entra_aba_dir} is not initialised (or belongs to another tenant). '
+    #             'Run once interactively without --dryrun, or: '
+    #             'python3 AADInternals_python/_aad_certificate_manager.py bootstrap '
+    #             f'--tenant-id <GUID> --state-dir {azure.entra_aba_dir} --apply'
+    #         )
 
     if config.has_option('common', 'enable_single_sign_on'):
         enable_single_sign_on = config.getboolean('common', 'enable_single_sign_on')
@@ -247,7 +312,7 @@ def run_sync(force=False,from_db=False):
 
     if not AzureObject.table_exists():
         db.create_tables([AzureObject])
-    ensure_tenant_sync(azure, hash_synchronization)
+    #ensure_tenant_sync(azure, hash_synchronization)
 
     if enable_single_sign_on:
 
@@ -304,6 +369,8 @@ def run_sync(force=False,from_db=False):
                 try:
                     azure.delete_user(user)
                     write_log_json_data('delete',azure.dict_az_user[user])
+                except PermissionsMissing:      # permissions not there (yet): abort the run
+                    raise
                 except:
                     write_log_json_data('error',{'sourceanchor':user,'action':'delete_user','traceback':traceback.format_exc(),'data_delete':azure.dict_az_user[user]})
                     continue
@@ -321,6 +388,8 @@ def run_sync(force=False,from_db=False):
                 try:
                     azure.delete_group(group)
                     write_log_json_data('delete',azure.dict_az_group[group])
+                except PermissionsMissing:      # permissions not there (yet): abort the run
+                    raise
                 except:
                     write_log_json_data('error',{'sourceanchor':group,'action':'delete_group','traceback':traceback.format_exc(),'data_delete':azure.dict_az_group[group]})
                     continue
@@ -339,6 +408,8 @@ def run_sync(force=False,from_db=False):
                     try:
                         azure.delete_device(device)
                         write_log_json_data('delete',azure.dict_az_devices[device])
+                    except PermissionsMissing:      # permissions not there (yet): abort the run
+                        raise
                     except:
                         write_log_json_data('error',{'sourceanchor':device,'action':'delete_device','traceback':traceback.format_exc(),'data_delete':azure.dict_az_devices[device]})
                         continue
@@ -356,6 +427,8 @@ def run_sync(force=False,from_db=False):
                 azure.send_obj_to_az(smb.dict_all_users_samba[entry])
                 write_log_json_data('send',smb.dict_all_users_samba[entry])
                 send_user = True
+            except PermissionsMissing:      # permissions not there (yet): abort the run
+                raise
             except:
                 dict_error[entry]=None
                 write_log_json_data('error',{'sourceanchor':entry,'action':'send_user','traceback':traceback.format_exc(),'data_send':smb.dict_all_users_samba[entry]})
@@ -383,6 +456,8 @@ def run_sync(force=False,from_db=False):
                 try:
                     azure.send_obj_to_az(smb.dict_all_device_samba[entry])
                     write_log_json_data('send',smb.dict_all_device_samba[entry])
+                except PermissionsMissing:      # permissions not there (yet): abort the run
+                    raise
                 except:
                     dict_error[entry]=None
                     write_log_json_data('error',{'sourceanchor':entry,'action':'send_device','traceback':traceback.format_exc(),'data_send':smb.dict_all_device_samba[entry]})
@@ -409,6 +484,8 @@ def run_sync(force=False,from_db=False):
             try:
                 azure.send_obj_to_az(smb.dict_all_group_samba[entry])
                 write_log_json_data('send',smb.dict_all_group_samba[entry])
+            except PermissionsMissing:      # permissions not there (yet): abort the run
+                raise
             except:
                 dict_error[entry]=None
                 write_log_json_data('error',{'sourceanchor':entry,'action':'send_group','traceback':traceback.format_exc(),'data_send':smb.dict_all_group_samba[entry]})
@@ -449,6 +526,8 @@ def run_sync(force=False,from_db=False):
                     AzureObject.insert(sourceanchor=entry,object_type='group',last_data_send =json.dumps(smb.dict_all_group_samba[entry]),last_data_send_date = datetime.datetime.now()).execute()
                 else:
                     AzureObject.update(last_data_send =json.dumps(smb.dict_all_group_samba[entry]),last_data_send_date = datetime.datetime.now()).where(AzureObject.sourceanchor==entry).execute()
+            except PermissionsMissing:      # permissions not there (yet): abort the run
+                raise
             except:
                 write_log_json_data('error',{'sourceanchor':entry,'action':'send_group','traceback':traceback.format_exc(),'data_send':smb.dict_all_group_samba[entry]})
                 continue
@@ -469,6 +548,8 @@ def run_sync(force=False,from_db=False):
                 try:
                     azure.send_hashnt(smb.dict_id_hash[entry],entry)
                     write_log_json_data('send_nthash',{'SourceAnchor':entry,'onPremisesSamAccountName':smb.dict_all_users_samba[entry]['onPremisesSamAccountName'],'nthash':'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'})
+                except PermissionsMissing:      # permissions not there (yet): abort the run
+                    raise
                 except Exception as e:
                     if "Result" in str(e):
                         if not already_wait:
@@ -478,6 +559,8 @@ def run_sync(force=False,from_db=False):
                         try:
                             azure.send_hashnt(smb.dict_id_hash[entry],entry)
                             write_log_json_data('send_nthash',{'SourceAnchor':entry,'onPremisesSamAccountName':smb.dict_all_users_samba[entry]['onPremisesSamAccountName'],'nthash':'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'})
+                        except PermissionsMissing:      # permissions not there (yet): abort the run
+                            raise
                         except Exception as e:
                             write_log_json_data('error',{'sourceanchor':entry,'action':'send_hashnt','traceback':traceback.format_exc(),'data_send_hashnt':{'SourceAnchor':entry,'onPremisesSamAccountName':smb.dict_all_users_samba[entry]['onPremisesSamAccountName'],'nthash':'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'}})
                             if "Result" in str(e):
@@ -513,13 +596,24 @@ if __name__ == '__main__':
     retry_delay = synchronization_interval_service
     announce = True      # say something after the start and after a failure, even if nothing was sent
     try:
+        try:
+            #startup_checks()          # permission checks: once per initial run / once per service start
+            checked_azure = startup_checks()          # permission checks: once per initial run / once per service start
+        except FatalSyncError as exc:
+            write_log_json_data("fatal", traceback.format_exc())
+            print("Fatal: %s" % exc, file=sys.stderr, flush=True)
+            sys.exit(2)
+
         while True:
             try:
-                run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync)
+                #run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync)
+                                #run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync)
+                run_sync(force=args.force,from_db=calculate_deletions_based_on_last_sync,azure=checked_azure)
+
                 retry_delay = synchronization_interval_service
                 report_run(announce)
                 announce = False
-            except FatalSyncError as exc:
+            except (FatalSyncError, PermissionsMissing) as exc:
                 write_log_json_data(
                     "fatal",
                     traceback.format_exc()
@@ -535,6 +629,7 @@ if __name__ == '__main__':
                       % (type(exc).__name__, exc, logfile, retry_delay), file=sys.stderr, flush=True)
                 take_stats()
                 announce = True
+            checked_azure = None
             if not args.servicemode :
                 break
             calculate_deletions_based_on_last_sync = True

@@ -6,6 +6,13 @@ entra_aba_dir = /root/entra_aba
 
 proxy =
 
+;When Entra refuses a call ("denied" / 401 / 403, e.g. a new application whose permissions are
+;not active yet), the call is repeated: first after permission_retry_delay seconds, then the wait
+;doubles. After permission_retry_count tries the run stops with "permissions not there (yet)".
+;Defaults 15 and 6: waits of 15+30+60+120+240 s, about 8 minutes in total.
+;permission_retry_delay = 15
+;permission_retry_count = 6
+
 ;remove accounts with a "sourceanchor" online and not found in samba
 do_delete=True
 

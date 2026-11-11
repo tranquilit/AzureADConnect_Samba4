@@ -1,5 +1,8 @@
 # Changelog
 
+## [2026-11-11]
+- Fixed Entra permission propagation by retrying access token acquisition until required roles are available.
+
 ## [2026-10-22]
 - Switch Azure AD Sync (WCF Binary) to the Microsoft Entra AD Synchronization Service (`6bf85cfa-ac8a-4be5-b5de-425a0d0dc016`) using PFX-based application authentication, the `6bf85cfa-ac8a-4be5-b5de-425a0d0dc016/.default` scope, and `ADSynchronization.ReadWrite.All`; use Microsoft Graph application permissions for user/group reads.
 - Add configurable `entra_aba_dir` (default: `/root/entra_aba`) for the PFX identity; support certificate rotation.

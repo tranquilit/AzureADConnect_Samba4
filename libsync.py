@@ -56,6 +56,9 @@ class AdConnect():
         self.dict_az_group={}
         self.dict_az_devices={}
         self.verify=True
+        # Optional retry policy for Entra permission propagation, see
+        # acquire_application_token(). None waits forever.
+        self.retry=None
 
     def connect(self):
         if not self.az:
@@ -63,7 +66,8 @@ class AdConnect():
                                    tenant_id=self.tenant_id,
                                    entra_aba_dir=self.entra_aba_dir,
                                    domain=self.domain,
-                                   verify=self.verify)
+                                   verify=self.verify,
+                                   retry=self.retry)
             self.az.get_token(scopes=[SYNC_SCOPE])
             self.tenant_id = self.az.tenant_id
 

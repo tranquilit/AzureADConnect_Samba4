@@ -114,6 +114,17 @@ def run_sync(force=False,from_db=False):
     else:
         azure.verify = True
 
+    # Bound the wait for Entra permission propagation. Options left out keep the
+    # default of waiting forever, which would hang a service cycle instead of
+    # letting it fail, get logged and retry on the next interval.
+    azure.retry = {}
+    for option, keyword in (('token_retry_max', 'max_retries'),
+                            ('token_retry_sleep', 'sleep_retry_time'),
+                            ('token_retry_sleep_increment_by', 'sleep_increment_by'),
+                            ('token_retry_sleep_multiplier', 'sleep_increment_multiplier')):
+        if config.has_option('common', option):
+            azure.retry[keyword] = config.getint('common', option)
+
     if config.has_option('common', 'tenant_id'):
         azure.tenant_id = config.get('common', 'tenant_id')
 

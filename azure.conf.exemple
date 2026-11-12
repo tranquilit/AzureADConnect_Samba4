@@ -33,3 +33,17 @@ dbpath = /root/last_send_azuread.db
 ;The script includes error detection in the event of duplicate mail on two different objects (In AD).
 warning_duplicate_mail_value=True
 
+; Microsoft Entra needs time to propagate the application permissions after the
+; initial setup or a certificate rotation. Until they appear, Entra issues an
+; access token without the required roles and the script asks again.
+; By default it asks forever, which is what an interactive install wants but
+; hangs a service cycle. Set token_retry_max to a positive value so the cycle
+; fails, is logged, and is retried on the next synchronization_interval_service.
+;token_retry_max = 10
+; Seconds between attempts (default 60).
+;token_retry_sleep = 60
+; Growth of the wait after each attempt: (sleep + increment_by) * multiplier.
+; Defaults keep it constant. The multiplier must be at least 1.
+;token_retry_sleep_increment_by = 0
+;token_retry_sleep_multiplier = 1
+

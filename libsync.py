@@ -74,25 +74,21 @@ class AdConnect():
 
     def enable_ad_sync(self):
         self.connect()
-        if self.dry_run:
-            return
-        self.az.set_adsyncenabled(enabledirsync=True)
+        if not self.dry_run:x
+            self.az.set_adsyncenabled(enabledirsync=True)
         
 
     def set_desktop_sso_enabled(self):
         self.connect()
-        if not self.dry_run:
-            self.az.set_desktop_sso_enabled(enable=True)
+        self.az.set_desktop_sso_enabled(enable=True)
 
     def set_desktop_sso(self, domain_name: str, password: str, computer_name: str = "AZUREADSSOACC", enable: bool = True):
         self.connect()
-        if not self.dry_run:
-            self.az.set_desktop_sso( domain_name, password, computer_name, enable)
+        self.az.set_desktop_sso( domain_name, password, computer_name, enable)
 
     def enable_password_hash_sync(self):
         self.connect()
-        if not self.dry_run:
-            self.az.set_sync_features(enable_features=['PasswordHashSync'])
+        self.az.set_sync_features(enable_features=['PasswordHashSync'])
 
     def send_obj_to_az(self,entry):
         self.connect()

@@ -74,8 +74,7 @@ class AdConnect():
 
     def enable_ad_sync(self):
         self.connect()
-        if not self.dry_run:x
-            self.az.set_adsyncenabled(enabledirsync=True)
+        self.az.set_adsyncenabled(enabledirsync=True)
         
 
     def set_desktop_sso_enabled(self):
